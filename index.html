@@ -1,0 +1,487 @@
+import React, { useMemo, useState, useEffect } from "react";
+import { motion } from "framer-motion";
+import { Calculator, Activity, AlertTriangle, Info, Printer, Syringe } from "lucide-react";
+
+// =====================
+// Types & Helpers
+// =====================
+type Category = "pretreatment" | "induction" | "paralytic";
+
+type Drug = {
+  key: string;
+  name: string;
+  unit: "mg" | "mcg"; // dose unit
+  route: string;
+  dose: number | [number, number]; // per kg
+  note?: string;
+  caps?: { amount: number; unit: "mg" | "mcg"; applyTo?: "min" | "max" | "both" }[]; // hard caps like SCh 200 mg
+  defaultConcentration: number; // same unit per mL
+  concEditable?: boolean;
+  rsiPreferred?: boolean;
+  adultOnly?: boolean;
+  category: Category;
+  pediatricVariant?: {
+    dose?: number | [number, number];
+    note?: string;
+  };
+};
+
+const DRUGS: Drug[] = [
+  // PRETREATMENT (choose 1 or none)
+  {
+    key: "fentanyl",
+    name: "Fentanil",
+    unit: "mcg",
+    route: "IV",
+    dose: [1, 2],
+    note: "Pré-tratamento/analgesia: 1–2 mcg/kg.",
+    defaultConcentration: 50,
+    concEditable: true,
+    category: "pretreatment",
+  },
+  {
+    key: "midazolam",
+    name: "Midazolam",
+    unit: "mg",
+    route: "IV",
+    dose: [0.05, 0.1],
+    note: "Sedação/amnésia: 0,05–0,1 mg/kg (não é o hipnótico de escolha p/ RSI).",
+    defaultConcentration: 1,
+    concEditable: true,
+    category: "pretreatment",
+  },
+  // INDUCTION (choose 1)
+  {
+    key: "ketamine",
+    name: "Cetamina (Ketamina)",
+    unit: "mg",
+    route: "IV",
+    dose: 1.5, // 1–2 mg/kg; usar 1.5 mg/kg como padrão
+    note: "Faixa típica RSI 1–2 mg/kg (hemodinamicamente estável/instável).",
+    defaultConcentration: 50,
+    concEditable: true,
+    rsiPreferred: true,
+    category: "induction",
+  },
+  {
+    key: "etomidate",
+    name: "Etomidato",
+    unit: "mg",
+    route: "IV",
+    dose: 0.3,
+    note: "Padrão 0,3 mg/kg. Útil se instabilidade hemodinâmica.",
+    defaultConcentration: 2,
+    rsiPreferred: true,
+    category: "induction",
+  },
+  {
+    key: "propofol",
+    name: "Propofol",
+    unit: "mg",
+    route: "IV",
+    dose: [1, 2],
+    note: "RSI 1–2 mg/kg (ajuste conforme hemodinâmica).",
+    defaultConcentration: 10,
+    concEditable: true,
+    category: "induction",
+  },
+  // PARALYTIC (choose 1)
+  {
+    key: "rocuronium",
+    name: "Rocurônio",
+    unit: "mg",
+    route: "IV",
+    dose: 1.2, // RSI dose
+    note: "RSI: 1,2 mg/kg (onset rápido).",
+    defaultConcentration: 10,
+    rsiPreferred: true,
+    category: "paralytic",
+  },
+  {
+    key: "succinylcholine",
+    name: "Succinilcolina",
+    unit: "mg",
+    route: "IV",
+    dose: 1.5, // adultos 1–1.5 mg/kg
+    note: "Adulto: 1–1,5 mg/kg. Máx 200 mg.",
+    defaultConcentration: 20,
+    caps: [{ amount: 200, unit: "mg", applyTo: "both" }],
+    rsiPreferred: true,
+    category: "paralytic",
+    pediatricVariant: {
+      dose: 2,
+      note: "Pediatria: 2 mg/kg IV (considere 3 mg/kg IM se necessário).",
+    },
+  },
+  {
+    key: "vecuronium",
+    name: "Vecurônio",
+    unit: "mg",
+    route: "IV",
+    dose: 0.1,
+    note: "Indução: 0,1 mg/kg (não é de primeira linha p/ RSI).",
+    defaultConcentration: 1,
+    category: "paralytic",
+  },
+];
+
+function clampDose(value: number, unit: "mg" | "mcg", caps?: Drug["caps"]) {
+  if (!caps || caps.length === 0) return { value, capped: false, capText: "" };
+  const cap = caps.find((c) => c.unit === unit);
+  if (!cap) return { value, capped: false, capText: "" };
+  if (value > cap.amount) {
+    return { value: cap.amount, capped: true, capText: `CAPEADO em ${cap.amount} ${unit}` };
+  }
+  return { value, capped: false, capText: "" };
+}
+
+const numberFmt = (n: number, digits = 1) =>
+  new Intl.NumberFormat("pt-BR", { maximumFractionDigits: digits, minimumFractionDigits: 0 }).format(n);
+
+// Pure helper for tests & reuse
+export function calcDose(drug: Drug, weight: number, isPeds: boolean, concOverride?: number) {
+  const dosePerKg = isPeds && drug.pediatricVariant?.dose ? drug.pediatricVariant.dose : drug.dose;
+  const conc = concOverride ?? drug.defaultConcentration;
+
+  let minPerKg: number | null = null;
+  let maxPerKg: number | null = null;
+
+  if (Array.isArray(dosePerKg)) {
+    minPerKg = dosePerKg[0];
+    maxPerKg = dosePerKg[1];
+  } else {
+    minPerKg = dosePerKg;
+    maxPerKg = null;
+  }
+
+  const calcOne = (perKg: number | null) => {
+    if (!perKg) return null as const;
+    const rawAmount = perKg * weight; // in mg or mcg
+    const { value } = clampDose(rawAmount, drug.unit, drug.caps);
+    const mL = conc > 0 ? value / conc : 0;
+    return { amount: value, mL };
+  };
+
+  return { min: calcOne(minPerKg), max: calcOne(maxPerKg) };
+}
+
+// =====================
+// Component
+// =====================
+export default function RSICalculator() {
+  const [kg, setKg] = useState<number | "">(70);
+  const [isPeds, setIsPeds] = useState(false);
+  // one choice per category; pretreatment can be null ("Nenhum")
+  const [choice, setChoice] = useState<{ pretreatment: string | null; induction: string | null; paralytic: string | null }>(
+    { pretreatment: "fentanyl", induction: "ketamine", paralytic: "rocuronium" }
+  );
+  const [concs, setConcs] = useState<Record<string, number>>(
+    Object.fromEntries(DRUGS.map((d) => [d.key, d.defaultConcentration]))
+  );
+
+  const weight = typeof kg === "number" && !isNaN(kg) ? kg : 0;
+
+  useEffect(() => {
+    // credit in the browser tab as well
+    document.title = "RSI Calculator – Desenvolvido por Raul Lima Capelo -(raulcapelo0@gmail.com)";
+  }, []);
+
+  const groups: Record<Category, Drug[]> = useMemo(
+    () => ({
+      pretreatment: DRUGS.filter((d) => d.category === "pretreatment"),
+      induction: DRUGS.filter((d) => d.category === "induction"),
+      paralytic: DRUGS.filter((d) => d.category === "paralytic"),
+    }),
+    []
+  );
+
+  const selectedDrugs = useMemo(() => {
+    const keys = [choice.pretreatment, choice.induction, choice.paralytic].filter(Boolean) as string[];
+    return DRUGS.filter((d) => keys.includes(d.key));
+  }, [choice]);
+
+  const computed = useMemo(() => {
+    return selectedDrugs.map((drug) => {
+      const conc = concs[drug.key] || drug.defaultConcentration;
+      const { min, max } = calcDose(drug, weight, isPeds, conc);
+      const note = isPeds && drug.pediatricVariant?.note ? drug.pediatricVariant.note : drug.note;
+      return { drug, min, max, conc, note };
+    });
+  }, [isPeds, concs, weight, selectedDrugs]);
+
+  const quickWeights = [50, 60, 70, 80, 90, 100, 120];
+  const printPage = () => window.print();
+
+  const RadioRow: React.FC<{ d: Drug; value: string | null; onChange: (key: string) => void }> = ({ d, value, onChange }) => (
+    <label className="flex items-center justify-between gap-2 rounded-xl border border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-800/50 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <input type="radio" name={d.category} checked={value === d.key} onChange={() => onChange(d.key)} />
+        <span className="text-sm">{d.name} <span className="opacity-60 text-xs">{d.route}</span></span>
+      </div>
+      {d.rsiPreferred && (
+        <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200">RSI</span>
+      )}
+    </label>
+  );
+
+  return (
+    <div className="min-h-screen w-full bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100 p-4 sm:p-6">
+      <div className="max-w-5xl mx-auto">
+        <motion.header initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-2xl bg-white/70 dark:bg-neutral-900 shadow">
+              <Syringe className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-2xl sm:text-3xl font-bold">Sequência de Intubação Rápida (RSI) – Calculadora por Peso</h1>
+              <p className="text-sm opacity-80">Informe o peso e selecione <b>uma opção por categoria</b>: pré-tratamento (opcional), hipnótico de indução e bloqueador neuromuscular.</p>
+            </div>
+          </div>
+          <button onClick={printPage} className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-white dark:bg-neutral-900 shadow text-sm hover:opacity-90">
+            <Printer className="w-4 h-4" /> Imprimir
+          </button>
+        </motion.header>
+
+        <section className="grid md:grid-cols-3 gap-4 mb-4">
+          <div className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow">
+            <label className="text-sm font-medium">Peso (kg)</label>
+            <input
+              type="number"
+              inputMode="decimal"
+              value={kg}
+              min={1}
+              onChange={(e) => setKg(e.target.value === "" ? "" : Number(e.target.value))}
+              className="mt-2 w-full rounded-xl border border-neutral-300 dark:border-neutral-700 bg-white/60 dark:bg-neutral-800 px-3 py-2 focus:outline-none"
+              placeholder="ex: 70"
+            />
+            <div className="flex flex-wrap gap-2 mt-3">
+              {quickWeights.map((w) => (
+                <button key={w} onClick={() => setKg(w)} className="px-2.5 py-1.5 rounded-lg bg-neutral-100 dark:bg-neutral-800 text-sm hover:opacity-90">
+                  {w} kg
+                </button>
+              ))}
+            </div>
+            <div className="mt-4 flex items-center gap-2">
+              <input id="peds" type="checkbox" checked={isPeds} onChange={(e) => setIsPeds(e.target.checked)} />
+              <label htmlFor="peds" className="text-sm">Pediatria</label>
+            </div>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow md:col-span-2">
+            <div className="flex items-center gap-2 mb-2">
+              <Calculator className="w-4 h-4" />
+              <h2 className="font-semibold">Seleção por categorias (1 de cada)</h2>
+            </div>
+
+            {/* PRETREATMENT */}
+            <div className="mb-4">
+              <div className="text-xs uppercase tracking-wide opacity-70 mb-1">Pré-tratamento (opcional)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                {groups.pretreatment.map((d) => (
+                  <RadioRow key={d.key} d={d} value={choice.pretreatment} onChange={(key) => setChoice((c) => ({ ...c, pretreatment: key }))} />
+                ))}
+                <label
+                  className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-neutral-300 dark:border-neutral-700 bg-neutral-50/40 dark:bg-neutral-800/30 px-3 py-2 text-sm cursor-pointer"
+                  onClick={() => setChoice((c) => ({ ...c, pretreatment: null }))}
+                >
+                  Nenhum
+                </label>
+              </div>
+            </div>
+
+            {/* INDUCTION */}
+            <div className="mb-4">
+              <div className="text-xs uppercase tracking-wide opacity-70 mb-1">Hipnótico de indução</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                {groups.induction.map((d) => (
+                  <RadioRow key={d.key} d={d} value={choice.induction!} onChange={(key) => setChoice((c) => ({ ...c, induction: key }))} />
+                ))}
+              </div>
+            </div>
+
+            {/* PARALYTIC */}
+            <div>
+              <div className="text-xs uppercase tracking-wide opacity-70 mb-1">Bloqueador neuromuscular</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                {groups.paralytic.map((d) => (
+                  <RadioRow key={d.key} d={d} value={choice.paralytic!} onChange={(key) => setChoice((c) => ({ ...c, paralytic: key }))} />
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-3 text-xs opacity-75 flex items-center gap-2">
+              <Info className="w-3.5 h-3.5" />
+              Concentrações são editáveis abaixo; ajuste conforme seu estoque local.
+            </div>
+          </div>
+        </section>
+
+        <section className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow">
+          <h3 className="font-semibold mb-3 flex items-center gap-2"><Activity className="w-4 h-4" /> Doses calculadas</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-left border-b border-neutral-200 dark:border-neutral-800">
+                <tr>
+                  <th className="py-2 pr-3">Fármaco</th>
+                  <th className="py-2 pr-3">Categoria</th>
+                  <th className="py-2 pr-3">Dose (por kg)</th>
+                  <th className="py-2 pr-3">Concentração</th>
+                  <th className="py-2 pr-3">Dose total</th>
+                  <th className="py-2 pr-3">Volume (mL)</th>
+                  <th className="py-2">Observações</th>
+                </tr>
+              </thead>
+              <tbody>
+                {computed.map(({ drug, min, max, conc, note }) => {
+                  const dosePerKg = isPeds && drug.pediatricVariant?.dose ? drug.pediatricVariant.dose : drug.dose;
+                  const doseLabel = Array.isArray(dosePerKg)
+                    ? `${(dosePerKg as [number, number]).map((v) => `${v}${drug.unit}/kg`).join(" – ")}`
+                    : `${dosePerKg as number}${drug.unit}/kg`;
+
+                  const totalLabel = () => {
+                    if (!min) return "—";
+                    if (max) {
+                      return `${numberFmt(min.amount, 0)}–${numberFmt(max.amount, 0)} ${drug.unit}`;
+                    }
+                    return `${numberFmt(min.amount, 0)} ${drug.unit}`;
+                  };
+
+                  const volumeLabel = () => {
+                    if (!min) return "—";
+                    if (max) {
+                      return `${numberFmt(min.mL, 1)}–${numberFmt(max!.mL, 1)} mL`;
+                    }
+                    return `${numberFmt(min.mL, 1)} mL`;
+                  };
+
+                  const catLabel = drug.category === "pretreatment" ? "Pré-trat." : drug.category === "induction" ? "Indução" : "BNM";
+
+                  return (
+                    <tr key={drug.key} className="border-b border-neutral-100 dark:border-neutral-800 hover:bg-neutral-50/60 dark:hover:bg-neutral-800/40">
+                      <td className="py-2 pr-3 font-medium">{drug.name} <span className="opacity-60 font-normal">{drug.route}</span></td>
+                      <td className="py-2 pr-3 whitespace-nowrap">{catLabel}</td>
+                      <td className="py-2 pr-3 whitespace-nowrap">{doseLabel}</td>
+                      <td className="py-2 pr-3">
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            value={concs[drug.key]}
+                            onChange={(e) => setConcs((c) => ({ ...c, [drug.key]: Number(e.target.value || 0) }))}
+                            className="w-24 rounded-lg border border-neutral-300 dark:border-neutral-700 bg-white/60 dark:bg-neutral-800 px-2 py-1"
+                            step={drug.unit === "mcg" ? 1 : 1}
+                          />
+                          <span className="opacity-70 text-xs">{drug.unit}/mL</span>
+                        </div>
+                      </td>
+                      <td className="py-2 pr-3 whitespace-nowrap">{totalLabel()}</td>
+                      <td className="py-2 pr-3 whitespace-nowrap">{volumeLabel()}</td>
+                      <td className="py-2 text-xs opacity-80 max-w-[22rem]">{note}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-100 text-xs flex gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <div>
+              <b>Aviso clínico:</b> Esta ferramenta não substitui o julgamento clínico. Ajuste as doses conforme hemodinâmica, comorbidades, indicação e interação medicamentosa. Verifique contraindicações (ex.: susc. maligna, hipercalemia, denervação para succinilcolina; TCE/hipotensão para propofol; broncoespasmo/hipotensão para escolhas específicas).
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-4 grid md:grid-cols-2 gap-4">
+          <div className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow text-sm">
+            <h4 className="font-semibold mb-2">Concentrações padrão (editar conforme necessário)</h4>
+            <ul className="grid sm:grid-cols-2 gap-2">
+              {DRUGS.map((d) => (
+                <li key={d.key} className="flex items-center justify-between gap-2 rounded-lg bg-neutral-50 dark:bg-neutral-800/40 px-3 py-2">
+                  <span>{d.name}</span>
+                  <div className="flex items-center gap-2 text-xs">
+                    <input
+                      type="number"
+                      value={concs[d.key]}
+                      onChange={(e) => setConcs((c) => ({ ...c, [d.key]: Number(e.target.value || 0) }))}
+                      className="w-20 rounded-lg border border-neutral-300 dark:border-neutral-700 bg-white/60 dark:bg-neutral-800 px-2 py-1"
+                    />
+                    <span className="opacity-70">{d.unit}/mL</span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-white dark:bg-neutral-900 shadow text-sm">
+            <h4 className="font-semibold mb-2">Dicas rápidas de RSI</h4>
+            <ul className="list-disc ml-5 space-y-1 opacity-90">
+              <li>Prepare material: laringoscópio, dispositivos alternativos, sucção, plano para via aérea difícil.</li>
+              <li>Pré-oxigenação 3–5 min (ou 8 vital capacity breaths).</li>
+              <li>Escolha 1 hipnótico e 1 bloqueador neuromuscular; pré-tratamento é opcional.</li>
+              <li>Empurre hipnótico e, após perda de consciência, administre o bloqueador; realize a intubação no tempo adequado.</li>
+              <li>Confirme posicionamento (capnografia) e fixe TOT. Inicie sedação/analgesia contínua pós-intubação.</li>
+            </ul>
+          </div>
+        </section>
+
+        <footer className="text-xs opacity-70 mt-6">
+          Versão: 13/08/2025 — Modo por categorias (1 de cada) implementado. <br />
+          Desenvolvido por <b>Raul Lima Capelo</b>.
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+// =====================
+// Runtime smoke tests (console)
+// =====================
+function almost(a: number, b: number, eps = 1e-6) { return Math.abs(a - b) < eps; }
+
+function runSmokeTests() {
+  try {
+    const w = 70;
+    // 1) Ketamine: 1.5 mg/kg @50 mg/mL => 105 mg, 2.1 mL
+    const ket = DRUGS.find((d) => d.key === "ketamine")!;
+    const k = calcDose(ket, w, false, 50);
+    console.assert(k.min && almost(k.min.amount, 105), "Ketamina mg falhou");
+    console.assert(k.min && almost(k.min.mL, 2.1), "Ketamina mL falhou");
+
+    // 2) Rocuronium: 1.2 mg/kg @10 mg/mL => 84 mg, 8.4 mL
+    const roc = DRUGS.find((d) => d.key === "rocuronium")!;
+    const r = calcDose(roc, w, false, 10);
+    console.assert(r.min && almost(r.min.amount, 84), "Rocurônio mg falhou");
+    console.assert(r.min && almost(r.min.mL, 8.4), "Rocurônio mL falhou");
+
+    // 3) Succinylcholine cap: 150 kg * 1.5 mg/kg = 225 mg -> cap 200 mg; @20 mg/mL => 10 mL
+    const sch = DRUGS.find((d) => d.key === "succinylcholine")!;
+    const s = calcDose(sch, 150, false, 20);
+    console.assert(s.min && almost(s.min.amount, 200), "SCh cap mg falhou");
+    console.assert(s.min && almost(s.min.mL, 10), "SCh cap mL falhou");
+
+    // 4) Fentanyl range: 70 kg * 1–2 mcg/kg => 70–140 mcg; @50 mcg/mL => 1.4–2.8 mL
+    const fen = DRUGS.find((d) => d.key === "fentanyl")!;
+    const f = calcDose(fen, w, false, 50);
+    console.assert(f.min && almost(f.min.amount, 70), "Fentanil min mcg falhou");
+    console.assert(f.max && almost(f.max.amount!, 140), "Fentanil max mcg falhou");
+    console.assert(f.min && almost(f.min.mL, 1.4), "Fentanil min mL falhou");
+    console.assert(f.max && almost(f.max.mL!, 2.8), "Fentanil max mL falhou");
+
+    // 5) Pediatric SCh: 20 kg * 2 mg/kg = 40 mg; @20 mg/mL => 2 mL
+    const sPeds = calcDose(sch, 20, true, 20);
+    console.assert(sPeds.min && almost(sPeds.min.amount, 40), "SCh pediátrico mg falhou");
+    console.assert(sPeds.min && almost(sPeds.min.mL, 2), "SCh pediátrico mL falhou");
+
+    // if all passed
+    // eslint-disable-next-line no-console
+    console.log("✅ RSI smoke tests: OK");
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("❌ RSI smoke tests falharam:", err);
+  }
+}
+
+if (typeof window !== "undefined" && !(window as any).__RSI_TESTS_RAN__) {
+  (window as any).__RSI_TESTS_RAN__ = true;
+  runSmokeTests();
+}
